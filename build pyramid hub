@@ -1,0 +1,457 @@
+-- Build the Pyramid! (123720558354386) by Janitors Studios
+-- Auto Farm + Auto Gym + Basic Utils
+-- 사용법: Madium executor에 전체 복사해서 실행
+-- E 수집 / E 배치 / Q 드랍 (공식 루프 기반)
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local VIM = nil
+pcall(function() VIM = game:GetService("VirtualInputManager") end)
+
+local LP = Players.LocalPlayer
+
+_G.AutoFarm = _G.AutoFarm or false
+_G.AutoGym = _G.AutoGym or false
+_G.AutoPlaceOnly = _G.AutoPlaceOnly or false
+
+-- ============ 유틸: 위치 찾기 (스트리밍 대응, 동적 + 하드코딩 폴백) ============
+local FALLBACK_QUARRY = Vector3.new(-236.54, 47.18 + 5, 36.61)
+local FALLBACK_PYRAMID = Vector3.new(294.56, 213.79 + 5, 41.99)
+
+local function findFirst(descendantCheck)
+    local ok, res = pcall(function()
+        for _, v in ipairs(Workspace:GetDescendants()) do
+            local r = descendantCheck(v)
+            if r then return r end
+        end
+        return nil
+    end)
+    if ok then return res end
+    return nil
+end
+
+local function getQuarryPos()
+    -- 1) QuarryBlocks 모델에서 찾기
+    local qb = Workspace:FindFirstChild("Quarry", true)
+    if qb then
+        local blocks = qb:FindFirstChild("QuarryBlocks", true) or qb
+        -- MeshPart 하나라도 있으면 그 위로
+        for _, v in ipairs(blocks:GetDescendants()) do
+            if v:IsA("BasePart") then
+                return v.Position + Vector3.new(0, 6, 0), v
+            end
+        end
+        if blocks:IsA("BasePart") then
+            return blocks.Position + Vector3.new(0, 6, 0), blocks
+        end
+    end
+    local title = Workspace:FindFirstChild("Title", true)
+    -- Quarry Title이 여러개일 수 있으니 Region 기준으로 한번 더
+    local regionQ = findFirst(function(v)
+        return v.Name == "Region:Quarry" and v:IsA("BasePart") and v
+    end)
+    if regionQ then
+        return regionQ.Position + Vector3.new(0, 5, 0), regionQ
+    end
+    return FALLBACK_QUARRY, nil
+end
+
+local function getPyramidPos()
+    local pb = Workspace:FindFirstChild("PyramidBuild")
+    if pb then
+        for _, v in ipairs(pb:GetDescendants()) do
+            if v:IsA("BasePart") then
+                return v.Position + Vector3.new(0, 6, 0), v
+            end
+        end
+    end
+    local regionP = findFirst(function(v)
+        return v.Name == "Region:Pyramid" and v:IsA("BasePart") and v
+    end)
+    if regionP then
+        return regionP.Position + Vector3.new(0, 5, 0), regionP
+    end
+    return FALLBACK_PYRAMID, nil
+end
+
+local function getBenchPrompt()
+    for _, v in ipairs(Workspace:GetDescendants()) do
+        if v:IsA("ProximityPrompt") and v.Name == "BenchPrompt" and v.Enabled then
+            local part = v.Parent
+            if part and part:IsA("BasePart") then
+                return v, part.Position
+            end
+        end
+    end
+    return nil, nil
+end
+
+local function teleport(cfPos)
+    local char = LP.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if hrp then
+        pcall(function()
+            -- 낙하/플링 방지: 속도 리셋 + 잠깐 앵커
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+            if hum then hum:ChangeState(Enum.HumanoidStateType.Physics) end
+            hrp.CFrame = CFrame.new(cfPos + Vector3.new(0, 3, 0))
+            task.wait(0.05)
+            if hum then hum:ChangeState(Enum.HumanoidStateType.GettingUp) end
+        end)
+    end
+end
+
+-- 안티치트 유발 의심되는 직접 리모트 호출은 기본 OFF
+-- 켜면 별도 스레드 + 타임아웃으로 화면 프리즈 방지
+_G.UseRemotes = false
+local function safeInvoke(rf, ...)
+    if not _G.UseRemotes then return end
+    local args = {...}
+    task.spawn(function()
+        local done = false
+        task.delay(3, function()
+            if not done then
+                warn("[PyramidHelper] 리모트 타임아웃, 스킵")
+            end
+        end)
+        pcall(function()
+            rf:InvokeServer(table.unpack(args))
+            done = true
+        end)
+        done = true
+    end)
+end
+
+local function pressE(times, holdMs)
+    times = times or 3
+    holdMs = holdMs or 100
+    -- 파밍 중 열면 화면 멈춘 것처럼 보이는 UI 프롬프트는 제외
+    local BLACKLIST = {
+        CodesPrompt = true,
+        FreeGiftPrompt = true,
+        EventSignupPrompt = true,
+        UpdateLogPrompt = true,
+        PharaohPrompt = true,
+        SunGodPrompt = true,
+    }
+    for i = 1, times do
+        -- 1) 근처 Prompt 중 파밍 관련만 fire
+        pcall(function()
+            local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                for _, v in ipairs(Workspace:GetDescendants()) do
+                    if v:IsA("ProximityPrompt") and v.Enabled then
+                        if BLACKLIST[v.Name] then continue end
+                        -- AutoGym이 아닐 땐 벤치 프롬프트 건드리지 않기
+                        if v.Name == "BenchPrompt" and not _G.AutoGym then continue end
+                        local p = v.Parent
+                        local pp = nil
+                        if p and p:IsA("BasePart") then pp = p.Position
+                        elseif p and p:IsA("Model") and p.PrimaryPart then pp = p.PrimaryPart.Position end
+                        if pp and (pp - hrp.Position).Magnitude < 22 then
+                            if typeof(fireproximityprompt) == "function" then
+                                fireproximityprompt(v, 0)
+                            else
+                                v:InputHoldBegin()
+                                task.wait(0.05)
+                                v:InputHoldEnd()
+                            end
+                        end
+                    end
+                end
+            end
+        end)
+        -- 2) E 키 이벤트 (커스텀 E 수집 대응)
+        pcall(function()
+            if VIM then
+                VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+                task.wait(holdMs / 1000)
+                VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+            end
+        end)
+        task.wait(0.15)
+    end
+end
+
+local function tryPickupRemote(targetInstance)
+    -- 직접 호출은 프리즈 원인이라 기본 OFF. E키만 사용.
+    -- 필요하면 GUI에서 UseRemotes를 켜세요.
+    if not _G.UseRemotes then return end
+    local ok, knit = pcall(function()
+        return ReplicatedStorage.Packages["_Index"]["sleitnick_knit@1.7.0"].knit.Services.BookService.RF
+    end)
+    if not ok or not knit or not knit.Pickup then return end
+    if targetInstance then
+        safeInvoke(knit.Pickup, targetInstance)
+    end
+end
+
+local function tryPlaceRemote()
+    if not _G.UseRemotes then return end
+    local ok, knit = pcall(function()
+        return ReplicatedStorage.Packages["_Index"]["sleitnick_knit@1.7.0"].knit.Services.PyramidService.RF
+    end)
+    if not ok or not knit or not knit.Place then return end
+    -- 인자 없이 호출이 정상 케이스일 가능성 (클라 미리보기에서 슬롯 계산)
+    safeInvoke(knit.Place)
+end
+
+local function getCarried()
+    -- leaderstats Blocks 우선, 없으면 CarryState 속성
+    local ls = LP:FindFirstChild("leaderstats")
+    if ls then
+        local b = ls:FindFirstChild("Blocks")
+        if b then
+            local n = tonumber(b.Value)
+            if n then return n end
+        end
+    end
+    local cs = LP:GetAttribute("CarryState")
+    if type(cs) == "string" then
+        local a, b = cs:match("^(%d+):(%d+)$")
+        if b then return tonumber(b) or 0 end
+    end
+    return 0
+end
+
+-- ============ Auto Farm 루프 (안전 모드: 순간이동 간격 늘림) ============
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if not _G.AutoFarm then continue end
+        local ok, err = pcall(function()
+            -- 1) 채석장으로 (어그로 줄이려고 텔레 후 1.2초 대기)
+            local qPos, qPart = getQuarryPos()
+            teleport(qPos)
+            task.wait(1.2)
+            -- 가득 찰 때까지 E 연타 (최대 8초)
+            local t0 = os.clock()
+            local lastCarry = -1
+            local stuck = 0
+            while _G.AutoFarm and os.clock() - t0 < 8 do
+                pressE(2, 80)
+                if qPart and qPart.Parent then
+                    tryPickupRemote(qPart)
+                end
+                task.wait(0.6)
+                local c = getCarried()
+                if c == lastCarry then
+                    stuck += 1
+                else
+                    stuck = 0
+                end
+                lastCarry = c
+                -- 3회 연속 변화 없으면 가득 찼다고 보고 이동
+                if stuck >= 6 and c > 0 then break end
+                -- 혹시 leaderstats가 문자열 "0/10" 형태면 따로 처리
+                if c > 0 and stuck >= 4 then
+                    -- Strength 10 기준 보통 2~4개 들고 시작, 계속 시도해도 안 늘면 이동
+                    if os.clock() - t0 > 4 then break end
+                end
+            end
+            -- 2) 피라미드로
+            local pPos = getPyramidPos()
+            teleport(pPos)
+            task.wait(1.2)
+            local t1 = os.clock()
+            while _G.AutoFarm and os.clock() - t1 < 8 do
+                pressE(2, 80)
+                tryPlaceRemote()
+                task.wait(0.6)
+                local c = getCarried()
+                if c == 0 then break end
+            end
+        end)
+        if not ok then
+            warn("[PyramidFarm] " .. tostring(err))
+            task.wait(1)
+        end
+    end
+end)
+
+-- ============ Auto Gym 루프 ============
+task.spawn(function()
+    while true do
+        task.wait(0.3)
+        if not _G.AutoGym then continue end
+        pcall(function()
+            local prompt, pos = getBenchPrompt()
+            if prompt and pos then
+                teleport(pos + Vector3.new(0, 2, 3))
+                task.wait(0.5)
+                if typeof(fireproximityprompt) == "function" then
+                    fireproximityprompt(prompt, 0)
+                end
+                -- RF 직접 시도 (인자 추측: bench id 숫자 or prompt part)
+                local okRF = pcall(function()
+                    return ReplicatedStorage.Packages["_Index"]["sleitnick_knit@1.7.0"].knit.Services.GymService.RF
+                end)
+                -- StartBench는 서버에서 자리 체크하므로 실패해도 프롬프트로 됨
+                task.wait(6) -- 운동 유지 시간
+            else
+                task.wait(2)
+            end
+        end)
+    end
+end)
+
+-- ============ 기본 유틸 ============
+local Utils = {}
+
+function Utils.setSpeed(n)
+    local h = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+    if h then h.WalkSpeed = n end
+    _G.WalkSpeed = n
+end
+
+function Utils.setJump(n)
+    local h = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+    if h then h.JumpPower = n end
+end
+
+LP.CharacterAdded:Connect(function(c)
+    task.wait(0.5)
+    if _G.WalkSpeed then
+        local h = c:FindFirstChildOfClass("Humanoid")
+        if h then h.WalkSpeed = _G.WalkSpeed end
+    end
+end)
+
+-- Noclip (v2: Stepped + Heartbeat 둘 다, 리스폰/들고있는 블록 대응)
+_G.Noclip = false
+local function applyNoclip()
+    if not _G.Noclip then return end
+    local char = LP.Character
+    if not char then return end
+    for _, v in ipairs(char:GetDescendants()) do
+        if v:IsA("BasePart") then
+            v.CanCollide = false
+        end
+    end
+    -- HumanoidRootPart가 간혹 씹혀서 별도 처리
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hrp then hrp.CanCollide = false end
+end
+RunService.Stepped:Connect(applyNoclip)
+RunService.Heartbeat:Connect(applyNoclip)
+-- 혹시 Stepped이 안 먹는 익스플로잇 대비 폴링 루프
+task.spawn(function()
+    while true do
+        task.wait(0.1)
+        applyNoclip()
+    end
+end)
+
+-- Fly (간단)
+_G.Fly = false
+local flyBV = nil
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        local char = LP.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if _G.Fly and hrp then
+            if not flyBV then
+                flyBV = Instance.new("BodyVelocity")
+                flyBV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+                flyBV.Velocity = Vector3.zero
+                flyBV.Parent = hrp
+            end
+            local cam = Workspace.CurrentCamera
+            local dir = Vector3.zero
+            if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir += cam.CFrame.LookVector end
+            if UserInputService:IsKeyDown(Enum.KeyCode.S) then dir -= cam.CFrame.LookVector end
+            if UserInputService:IsKeyDown(Enum.KeyCode.A) then dir -= cam.CFrame.RightVector end
+            if UserInputService:IsKeyDown(Enum.KeyCode.D) then dir += cam.CFrame.RightVector end
+            if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir += Vector3.new(0, 1, 0) end
+            if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then dir -= Vector3.new(0, 1, 0) end
+            flyBV.Velocity = dir * 60
+        else
+            if flyBV then flyBV:Destroy() flyBV = nil end
+        end
+    end
+end)
+
+-- Anti AFK
+pcall(function()
+    local VU = game:GetService("VirtualUser")
+    LP.Idled:Connect(function()
+        VU:CaptureController()
+        VU:ClickButton2(Vector2.new())
+    end)
+end)
+
+-- ============ 간단 GUI ============
+local function makeGui()
+    pcall(function()
+        local old = game:GetService("CoreGui"):FindFirstChild("PyramidHelper")
+        if old then old:Destroy() end
+    end)
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "PyramidHelper"
+    gui.ResetOnSpawn = false
+    pcall(function() gui.Parent = game:GetService("CoreGui") end)
+    if not gui.Parent then gui.Parent = LP:WaitForChild("PlayerGui") end
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 200, 0, 340)
+    frame.Position = UDim2.new(0, 20, 0, 100)
+    frame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Draggable = true
+    frame.Parent = gui
+
+    local function btn(text, y, cb)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(1, -20, 0, 32)
+        b.Position = UDim2.new(0, 10, 0, y)
+        b.Text = text
+        b.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+        b.TextColor3 = Color3.new(1, 1, 1)
+        b.Font = Enum.Font.SourceSansBold
+        b.TextSize = 15
+        b.Parent = frame
+        b.MouseButton1Click:Connect(function() cb(b) end)
+        return b
+    end
+
+    btn("AutoFarm: OFF", 10, function(b)
+        _G.AutoFarm = not _G.AutoFarm
+        b.Text = "AutoFarm: " .. (_G.AutoFarm and "ON" or "OFF")
+    end)
+    btn("AutoGym: OFF", 48, function(b)
+        _G.AutoGym = not _G.AutoGym
+        b.Text = "AutoGym: " .. (_G.AutoGym and "ON" or "OFF")
+    end)
+    btn("Speed 32", 86, function() Utils.setSpeed(32) end)
+    btn("Speed 60", 122, function() Utils.setSpeed(60) end)
+    btn("Noclip: OFF", 158, function(b)
+        _G.Noclip = not _G.Noclip
+        b.Text = "Noclip: " .. (_G.Noclip and "ON" or "OFF")
+    end)
+    btn("Fly: OFF", 194, function(b)
+        _G.Fly = not _G.Fly
+        b.Text = "Fly: " .. (_G.Fly and "ON" or "OFF")
+    end)
+    btn("Remotes: OFF(안전)", 232, function(b)
+        _G.UseRemotes = not _G.UseRemotes
+        b.Text = "Remotes: " .. (_G.UseRemotes and "ON(위험)" or "OFF(안전)")
+    end)
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -20, 0, 40)
+    label.Position = UDim2.new(0, 10, 0, 272)
+    label.BackgroundTransparency = 1
+    label.TextColor3 = Color3.fromRGB(180, 180, 180)
+    label.TextWrapped = true
+    label.TextSize = 12
+    label.Text = "프리즈나면 Remotes OFF + Farm만 켜기\nNoclip v2 적용됨"
+    label.Parent = frame
+end
+makeGui()
+print("[PyramidHelper] 로드됨. GUI에서 토글하세요.")
